@@ -92,8 +92,112 @@ Delivery의 경우 산출물을 전달받는 것 까지만 실행. 배포는 사
 # 우리 팀의 CI / CD (`main` 브랜치 기준)
 
 ![](pictures/mycicd.png)
-
+다음은 우리 팀의 ci / cd 플로우 로직이다.
 ## CI
+
+코드
+```yaml
+name: Prod Server CI
+
+on:
+  pull_request:
+    types: [ opened, synchronize, reopened ]
+    branches: [ main ]
+    paths: [ 'app/**' ]
+  push:
+    branches: [ main ]
+    paths: [ 'app/**' ]
+
+jobs:
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v2
+      - name: build with Gradle
+        run: ./gradlew clean test
+
+  build-and-push:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v2
+      - name: build with Gradle
+        run: ./gradlew clean build
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v5
+        with:
+
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: |
+            # 🚨 Docker Hub 리포지토리 이름 일반화 (가장 중요!)
+            ${{ secrets.DOCKERHUB_USERNAME }}/your-prod-repo:${{ github.sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/your-prod-repo:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/your-prod-repo:buildcache,mode=max
+
+      - name: Save image tag to file
+        run: echo ${{ github.sha }} > ./image-tag.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: app/image-tag.txt
+
+```
 
 - 트리거
     - main ← 을 향하는 PR 발생 시: main에 합쳐지기 전에, 기존 코드를 망치지 않는지 테스트하고, 검증한다.
@@ -117,6 +221,74 @@ Delivery의 경우 산출물을 전달받는 것 까지만 실행. 배포는 사
     5. `Save image tag to file` : 위에서 만든 이미지 태그를 저장 후 아티팩트(저장소)에 넣어두고 CD 과정에서 활용할 수 있도록 한다.
 
 ## CD
+
+코드
+```yaml
+# 💻 Example: CD Workflow for Production
+
+name: Prod Server CD
+
+on:
+  workflow_run:
+    workflows: [ "Prod Server CI" ]
+    types: [ completed ]
+    branches: [ main ]
+
+jobs:
+  deploy:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: [your-self-hosted] 
+
+    permissions:
+      actions: read
+
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }} 
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Stop and remove existing container
+        run: |
+          # 컨테이너 이름 일반화
+          if [ "$(sudo docker ps -a -q -f name=your-container-name)" ]; then
+            sudo docker stop your-container-name
+            sudo docker rm -f your-container-name
+          fi
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+
+      - name: Extract deploy tag
+        run: |
+          echo "DEPLOY_TAG=$(cat image-tag.txt)" >> $GITHUB_ENV
+          echo "Deploying version: $(cat image-tag.txt)"
+
+      - name: Pull image
+        run: |
+          sudo docker pull your-dockerhub-username/your-prod-repo:${{ env.DEPLOY_TAG }}
+
+      - name: Deploy with Docker Compose
+        env:
+          IMAGE_TAG: ${{ env.DEPLOY_TAG }}
+        run: |
+          cd /path/to/your/project
+          
+          echo "Deploying with image tag: $IMAGE_TAG"
+          sudo -E docker compose up --no-deps -d app
+
+      - name: Prune old images
+        run: sudo docker image prune -f
+
+```
 
 - 트리거:
     - “`Prod Server CI`” 라는 이름을 가진 워크플로우가 실행이 끝났을 때.
@@ -198,7 +370,7 @@ CD에 역할이 추가된다.
 
 기존역할 + 서버 상태 관리 + 트래픽 제어
 
-### 서버 상태 관리
+(이 부분은 무중단 배포를 직접 적용해보고 변경점을 추가할 예정입니다.)
 
 ## **무중단 배포 CI/CD의 핵심: '어디에' 배포하고 '언제' 전환할 것인가?**
 
